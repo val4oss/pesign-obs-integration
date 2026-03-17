@@ -52,7 +52,9 @@ Spec file to rebuild RPMs with signatures
 # avoid loops
 export BRP_PESIGN_FILES=""
 
-pushd %buildroot
+# First pass: classify all RPMs.
+# Special RPMs (src, debuginfo, baselibs, filtered) are copied to their
+# destination immediately. Eligible RPMs are collected for per-RPM processing.
 disturl=
 rpms_filter=@PESIGN_PACKAGES@
 rpms=()
@@ -85,7 +87,6 @@ for rpm in %_sourcedir/*.rpm; do
 		cp "$rpm" "$_"
 		continue
 	fi
-	rpm2cpio "$rpm" | cpio -idm
 	d=$(rpm -qp --qf '%%{disturl}' "$rpm")
 	if test -z "$disturl"; then
 		disturl=$d
@@ -96,7 +97,7 @@ for rpm in %_sourcedir/*.rpm; do
 	fi
 	rpms=("${rpms[@]}" "$rpm")
 done
-popd
+
 if [ ${#rpms[@]} -eq 0 ]; then
     echo "No repackage RPMs found, exiting."
     # Found that _build_create_debug can not disable debug package building
@@ -104,6 +105,7 @@ if [ ${#rpms[@]} -eq 0 ]; then
     rm -f %buildroot/../SPECPARTS/rpm-debuginfo.specpart
     exit 0
 fi
+
 # Copy files other than the meta files and RPMs to %%_topdir/OTHER
 OTHER_FILES=`find %_sourcedir/ -maxdepth 1 -type f \
 	-not -regex '.*\.\(rpm\|spec\|changes\|rsasign\|sig\|crt\)' \
@@ -126,8 +128,13 @@ if test -e %_sourcedir/source_files.cpio; then
 	cpio -i < source_files.cpio
 	popd
 fi
-mkdir rsasigned
-pushd rsasigned
+
+# Set up the rsasigned directory once.  All signatures are extracted and
+# verified here before any RPM is processed so that a bad signature is caught
+# early and does not leave a partially-rebuilt set of RPMs behind.
+rsasigned_dir="$PWD/rsasigned"
+mkdir "$rsasigned_dir"
+pushd "$rsasigned_dir"
 cpio -idm <%_sourcedir/@NAME@.cpio.rsasign.sig
 cat >cert.crt <<EOF
 @CERT@
@@ -137,7 +144,7 @@ if test "$(wc -l <cert.crt)" -le 1 -a -s %_sourcedir/_projectcert.crt ; then
 fi
 if test "$(wc -l <cert.crt)" -gt 1; then
 	openssl x509 -inform PEM -in cert.crt -outform DER -out cert.x509
-	cert=cert.x509
+	cert="$rsasigned_dir/cert.x509"
 else
 	echo "warning: No buildservice project certificate found, add"
 	echo "warning: # needssslcertforbuild to the specfile"
@@ -145,112 +152,148 @@ else
 	cert=/usr/lib/rpm/pesign/pesign-cert.x509
 fi
 mkdir nss-db
-nss_db=$PWD/nss-db
+nss_db="$PWD/nss-db"
 echo "Eir4;Qua.daeJ,hP0" > "$nss_db/passwd"
 certutil -N -d "$nss_db" -f "$nss_db/passwd"
 certutil -A -d "$nss_db" -f "$nss_db/passwd" -n cert -t CT,CT,CT -i "$cert"
 
 # Extract the public key of the certificate
 openssl x509 -in "$cert" -inform DER -pubkey -noout > "$cert.pub"
+cert_pub="$cert.pub"
 
-sigs=($(find -type f -name '*.sig' -printf '%%P\n'))
+# Collect and verify all signature files upfront.
+# A bad signature here aborts the whole build before any RPM is touched.
+mapfile -t sigs < <(find . -type f -name '*.sig' -printf '%%P\n')
 for sig in "${sigs[@]}"; do
-	# Verify the signature with the public key of the certificate
-	ver_err=$(openssl rsautl -verify -inkey "$cert.pub" -pubin -in "$sig" 2>&1 | grep -i error) || true
+	ver_err=$(openssl rsautl -verify -inkey "$cert_pub" -pubin -in "$sig" 2>&1 | grep -i error) || true
 	if [ -n "$ver_err" ]; then
 		echo "$sig signature can not be decrypted by $cert" >&2
 		exit 1
 	fi
-	f=%buildroot/${sig%.sig}
-	case "/$sig" in
-	*.ko.sig|*.mod.sig)
-		/usr/lib/rpm/pesign/kernel-sign-file -i pkcs7 -s "$sig" sha256 "$cert" "$f"
-		;;
-	*.auth.sig)
-		/usr/lib/rpm/pesign/kernel-sign-file -N -P -d -C "$cert" -i pkcs7 -s "$sig" sha256 "$cert" "$f"
-		fbase="${f##*/}"
-		fbase="${fbase%.auth}"
-		fbase="${fbase%%-*}"
-		perl -0777 -npe 's/\A(?:[\040-\176]\0)+.{18}\0\0.{14}\0\0//s' < "$f" > "$f.orig"
-		sign-efi-sig-list -i "$f.p7sd" "$fbase" "$f.orig" "$f.tmp"
-		mv "$f.tmp" "$f"
-		rm -f "$f.p7s" "$f.p7sd" "$f.orig"
-		;;
-	/boot/* | *.efi.sig | */lib/modules/*/vmlinu[xz].sig | */lib/modules/*/[Ii]mage.sig | */lib/modules/*/z[Ii]mage.sig)
-%ifarch %ix86 x86_64 aarch64 %arm riscv64 loongarch64
-		# PE style signature injection
-		infile=${sig%.sig}
-		cpio -i --to-stdout ${infile#./} <%_sourcedir/@NAME@.cpio.rsasign > ${infile}.sattrs
-		test -s ${infile}.sattrs || exit 1
-		ohash=$(pesign -n "$nss_db" -h -P -i "$f")
-		pesign -n "$nss_db" -c cert -i "$f" -o "$f.tmp" -d sha256 -I "${infile}.sattrs" -R "$sig"
-		rm -f "${infile}.sattrs"
-		mv "$f.tmp" "$f"
-		nhash=$(pesign -n "$nss_db" -h -P -i "$f")
-		if test "$ohash" != "$nhash" ; then
-		    echo "hash mismatch error: $ohash $nhash"
-		    exit 1
-		fi
-%else
-		# appending to the file itself, e.g. for s390x.
-		/usr/lib/rpm/pesign/kernel-sign-file -i pkcs7 -s "$sig" sha256 "$cert" "$f"
-%endif
-		# Regenerate the HMAC if it exists
-		hmac="${f%%/*}/.${f##*/}.hmac"
-		if test -e "$hmac"; then
-			/usr/lib/rpm/pesign/gen-hmac -r %buildroot "/${sig%.sig}"
-		fi
-		;;
-	*stage3.bin.sig)
-		/usr/lib/rpm/pesign/kernel-sign-file -i pkcs7 -s "$sig" sha256 "$cert" "$f"
-		;;
-	*grub.elf.sig)
-		sig_size="$(wc -c < "$sig")"
-		unsigned_grub_size="$(wc -c < "$f")"
-		/usr/lib/rpm/pesign/kernel-sign-file -vpd -i pkcs7 -s "$sig" sha256 "$cert" "$f"
-		sig_size="$(wc -c < "$f.p7s")"
-		footer_size=40 # 12 bytes signature info structure, 28 bytes signature magic string
-		grub_size="$(wc -c < "$f")"
-		if ! [ $(expr "$sig_size" + "$footer_size") -le "@PESIGN_GRUB_RESERVATION@" ] ; then
-			echo "size of '$f.p7s' ($sig_size) cannot fit into reservation @PESIGN_GRUB_RESERVATION@ (-$footer_size)"
-			exit 1
-		fi
-		sig_size="$(expr "@PESIGN_GRUB_RESERVATION@" - "$footer_size")"
-		truncate -s $sig_size "$f.p7s"
-		/usr/lib/rpm/pesign/kernel-sign-file -v -i pkcs7 -s "$f.p7s" sha256 "" "$f"
-		rm "$f.p7s"
-		grub_size="$(wc -c < "$f")"
-		if ! [ "$(expr "$unsigned_grub_size" + "@PESIGN_GRUB_RESERVATION@")" -eq "$grub_size" ] ; then
-			echo "The size of unsigned grub ($unsigned_grub_size) + reservation (@PESIGN_GRUB_RESERVATION@) does not add up to signed grub size ($grub_size)"
-			exit 1
-		fi
-		;;
-	*)
-		echo "Warning: unhandled signature: $sig" >&2
-	esac
 done
-
-# Remove the public key file
-rm "$cert.pub"
-
 popd
-/usr/lib/rpm/pesign/pesign-gen-repackage-spec @PESIGN_REPACKAGE_COMPRESS@ @PESIGN_LOAD_SPEC_MACROS@ \
-	--directory=%buildroot "${rpms[@]}"
 
-# For some reason in Fedora/CentOS builds the directory structure is different from SUSE,
-# which breaks repacking. Copy the package content to the buildroot that is actually used.
-# Also all the usual tricks to disable the debug package fail, and the build fails due to
-# the 'Empty files file <...>/debugsourcefiles.list' error. Delete the specpart to bypass it.
+# Process each RPM independently: extract → sign → repackage → clean up.
+# Using an isolated buildroot per RPM prevents file-path collisions that
+# occur when two sub-packages install the same path (e.g. via
+# RemovePathPostfixes) and would otherwise overwrite each other in a shared
+# buildroot, breaking the repackaging of both RPMs.
+for rpm in "${rpms[@]}"; do
+	rpm_name=$(rpm -qp --qf '%%{name}' "$rpm")
+	echo "Processing $rpm_name..."
+
+	# Isolated buildroot for this RPM only
+	rpm_buildroot="%buildroot/$rpm_name"
+	mkdir -p "$rpm_buildroot"
+
+	# Extract this RPM into its own buildroot
+	rpm2cpio "$rpm" | (cd "$rpm_buildroot"; cpio -idm --quiet)
+
+	# Apply only the signatures whose target file exists in this RPM's
+	# buildroot.  Signatures belonging to other RPMs are silently skipped.
+	pushd "$rsasigned_dir"
+	for sig in "${sigs[@]}"; do
+		f="$rpm_buildroot/${sig%.sig}"
+		# Skip signatures that do not belong to this RPM
+		test -e "$f" || continue
+		case "/$sig" in
+		*.ko.sig|*.mod.sig)
+			/usr/lib/rpm/pesign/kernel-sign-file -i pkcs7 -s "$sig" sha256 "$cert" "$f"
+			;;
+		*.auth.sig)
+			/usr/lib/rpm/pesign/kernel-sign-file -N -P -d -C "$cert" -i pkcs7 -s "$sig" sha256 "$cert" "$f"
+			fbase="${f##*/}"
+			fbase="${fbase%.auth}"
+			fbase="${fbase%%-*}"
+			perl -0777 -npe 's/\A(?:[\040-\176]\0)+.{18}\0\0.{14}\0\0//s' < "$f" > "$f.orig"
+			sign-efi-sig-list -i "$f.p7sd" "$fbase" "$f.orig" "$f.tmp"
+			mv "$f.tmp" "$f"
+			rm -f "$f.p7s" "$f.p7sd" "$f.orig"
+			;;
+		/boot/* | *.efi.sig | */lib/modules/*/vmlinu[xz].sig | */lib/modules/*/[Ii]mage.sig | */lib/modules/*/z[Ii]mage.sig)
+%ifarch %ix86 x86_64 aarch64 %arm riscv64 loongarch64
+			# PE style signature injection
+			infile=${sig%.sig}
+			cpio -i --to-stdout ${infile#./} <%_sourcedir/@NAME@.cpio.rsasign > ${infile}.sattrs
+			test -s ${infile}.sattrs || exit 1
+			ohash=$(pesign -n "$nss_db" -h -P -i "$f")
+			pesign -n "$nss_db" -c cert -i "$f" -o "$f.tmp" -d sha256 -I "${infile}.sattrs" -R "$sig"
+			rm -f "${infile}.sattrs"
+			mv "$f.tmp" "$f"
+			nhash=$(pesign -n "$nss_db" -h -P -i "$f")
+			if test "$ohash" != "$nhash" ; then
+			    echo "hash mismatch error: $ohash $nhash"
+			    exit 1
+			fi
+%else
+			# appending to the file itself, e.g. for s390x.
+			/usr/lib/rpm/pesign/kernel-sign-file -i pkcs7 -s "$sig" sha256 "$cert" "$f"
+%endif
+			# Regenerate the HMAC if it exists
+			hmac="${f%%/*}/.${f##*/}.hmac"
+			if test -e "$hmac"; then
+				/usr/lib/rpm/pesign/gen-hmac -r "$rpm_buildroot" "/${sig%.sig}"
+			fi
+			;;
+		*stage3.bin.sig)
+			/usr/lib/rpm/pesign/kernel-sign-file -i pkcs7 -s "$sig" sha256 "$cert" "$f"
+			;;
+		*grub.elf.sig)
+			sig_size="$(wc -c < "$sig")"
+			unsigned_grub_size="$(wc -c < "$f")"
+			/usr/lib/rpm/pesign/kernel-sign-file -vpd -i pkcs7 -s "$sig" sha256 "$cert" "$f"
+			sig_size="$(wc -c < "$f.p7s")"
+			footer_size=40 # 12 bytes signature info structure, 28 bytes signature magic string
+			grub_size="$(wc -c < "$f")"
+			if ! [ $(expr "$sig_size" + "$footer_size") -le "@PESIGN_GRUB_RESERVATION@" ] ; then
+				echo "size of '$f.p7s' ($sig_size) cannot fit into reservation @PESIGN_GRUB_RESERVATION@ (-$footer_size)"
+				exit 1
+			fi
+			sig_size="$(expr "@PESIGN_GRUB_RESERVATION@" - "$footer_size")"
+			truncate -s $sig_size "$f.p7s"
+			/usr/lib/rpm/pesign/kernel-sign-file -v -i pkcs7 -s "$f.p7s" sha256 "" "$f"
+			rm "$f.p7s"
+			grub_size="$(wc -c < "$f")"
+			if ! [ "$(expr "$unsigned_grub_size" + "@PESIGN_GRUB_RESERVATION@")" -eq "$grub_size" ] ; then
+				echo "The size of unsigned grub ($unsigned_grub_size) + reservation (@PESIGN_GRUB_RESERVATION@) does not add up to signed grub size ($grub_size)"
+				exit 1
+			fi
+			;;
+		*)
+			echo "Warning: unhandled signature: $sig" >&2
+		esac
+	done
+	popd
+
+	# Generate a repackage spec for this single RPM.
+	/usr/lib/rpm/pesign/pesign-gen-repackage-spec @PESIGN_REPACKAGE_COMPRESS@ @PESIGN_LOAD_SPEC_MACROS@ \
+		--directory="$rpm_buildroot" "$rpm"
+
+	# For some reason in Fedora/CentOS builds the directory structure is
+	# different from SUSE, which breaks repacking. Copy the package content
+	# to the buildroot that is actually used.
+	# Also all the usual tricks to disable the debug package fail, and the
+	# build fails due to the 'Empty files file <...>/debugsourcefiles.list'
+	# error. Delete the specpart to bypass it.
 %if 0%{?fedora} || 0%{?rhel_version} || 0%{?centos_version}
 	echo "%%install" >>repackage.spec
-	echo "cp -r %buildroot/* %%buildroot" >>repackage.spec
-	echo "rm -f %buildroot/../SPECPARTS/rpm-debuginfo.specpart" >>repackage.spec
+	echo "cp -r $rpm_buildroot/* %%buildroot" >>repackage.spec
+	echo "rm -f $rpm_buildroot/../SPECPARTS/rpm-debuginfo.specpart" >>repackage.spec
 %endif
 
-rpmbuild --define "%%buildroot %buildroot" --define "%%disturl $disturl" \
-	--define "%%_builddir $PWD" \
-	--define "%%_binaries_in_noarch_packages_terminate_build 0" \
-	--define "%_suse_insert_debug_package %%{nil}" -bb repackage.spec
+	rpmbuild --define "%%buildroot $rpm_buildroot" --define "%%disturl $disturl" \
+		--define "%%_builddir $PWD" \
+		--define "%%_binaries_in_noarch_packages_terminate_build 0" \
+		--define "%_suse_insert_debug_package %%{nil}" -bb repackage.spec
+
+	# Each RPM is rebuilt immediately; discard its isolated buildroot before
+	# processing the next RPM to keep disk usage low.
+	rm -rf "$rpm_buildroot"
+done
+
+# Remove the public key file and the rsasigned working directory
+rm -f "$cert_pub"
+rm -rf "$rsasigned_dir"
 
 # This is needed by the kernel packages. Ideally, we should not run _any_ brp
 # checks, because the RPMs passed them once already

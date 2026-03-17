@@ -619,6 +619,7 @@ if (!exists($packages{$main_name})) {
 		name => $main_name,
 		version => $main_ver,
 		release => $main_rel,
+		files => [],  # empty list so %files section is emitted and rpmbuild does not error
 	};
 	for my $tag (qw(description changelog), @simple_tags) {
 		next if $packages{$main_name}->{$tag};
